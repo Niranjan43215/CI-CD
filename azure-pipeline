@@ -1,0 +1,108 @@
+trigger:
+ branches:
+ include:
+ - main
+pool:
+ vmImage: ubuntu-latest
+variables:
+ - group: 'sample-web-variable group'
+stages:
+ - stage: BuildAndPush
+ displayName: Build and Push Docker Image to ACR
+ condition: and(succeeded(), eq(variables['SkipBuildAndPush'], 'false'))
+ jobs:
+ - job: Build
+ displayName: Build Docker Image and Push to ACR
+ steps:
+ - checkout: self
+ - task: Docker@2
+ displayName: Build and Push Docker Image to ACR
+ inputs:
+ containerRegistry: $(dockerRegistryServiceConnection)
+ repository: $(imageName)
+ command: buildAndPush
+ dockerfile: Dockerfile
+ tags: |
+ $(imageTag)
+ - task: CopyFiles@2
+ displayName: Copy Kubernetes Manifests
+ inputs:
+ SourceFolder: '$(System.DefaultWorkingDirectory)/manifests'
+ Contents: "**"
+ TargetFolder: '$(Build.ArtifactStagingDirectory)/manifests'
+ - task: PublishBuildArtifacts@1
+ displayName: Publish Build Artifacts
+ inputs:
+ PathtoPublish: $(Build.ArtifactStagingDirectory)/manifests
+ ArtifactName: drop
+ publishLocation: Container
+ - stage: DeployToAKS
+ displayName: Deploy to AKS
+ dependsOn: BuildAndPush
+ condition: always()
+ jobs:
+ - job: Deploy
+ displayName: Deploy Docker Image to AKS
+ steps:
+ - task: DownloadBuildArtifacts@1
+ displayName: Download Build Artifacts
+ inputs:
+ buildType: current
+ downloadType: single
+ artifactName: drop
+ downloadPath: $(System.ArtifactsDirectory)
+ - task: Kubernetes@1
+ displayName: Configure kubectl context for AKS
+ inputs:
+ connectionType: 'Azure Resource Manager'
+ azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+ azureResourceGroup: $(aksResourceGroup)
+ kubernetesCluster: $(aksClusterName)
+ command: 'get'
+ arguments: 'nodes'
+ - task: Kubernetes@1
+ displayName: Create Namespace if Not Exists
+ inputs:
+ connectionType: 'Azure Resource Manager'
+ azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+ azureResourceGroup: $(aksResourceGroup)
+ kubernetesCluster: $(aksClusterName)
+ namespace: ''
+ command: 'apply'
+ useConfigurationFile: true
+ configuration: '$(System.ArtifactsDirectory)/drop/namespace.yaml'
+ - script: |
+ echo "Updating image tag in the Kubernetes deployment file..."
+ sed -i 's|$(acrLogin server)/$(imageName):[^ ]*|$(acrLogin server)/$(imageName):$(imageTag)|' $(System.ArtifactsDirectory)/drop/sampleweb-deployment.yaml
+ displayName: Update Image Tag in Deployment Manifest
+ - task: Kubernetes@1
+ displayName: Deploy Application to AKS
+ inputs:
+ connectionType: 'Azure Resource Manager'
+ azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+ azureResourceGroup: $(aksResourceGroup)
+ kubernetesCluster: $(aksClusterName)
+ namespace: $(namespace)
+ command: 'apply'
+ useConfigurationFile: true
+ configuration: '$(System.ArtifactsDirectory)/drop'
+ - stage: VerifyDeployment
+ displayName: Verify AKS Deployment Readiness Status
+ dependsOn: DeployToAKS
+ condition: succeeded() # Only run if the previous stages succeeded
+ jobs:
+ - job: Verify
+ displayName: Verify AKS Deployment Readiness
+ steps:
+ - task: Kubernetes@1
+ displayName: Check AKS Deployment Readiness
+ inputs:
+ connectionType: 'Azure Resource Manager'
+ azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+ azureResourceGroup: $(aksResourceGroup)
+ kubernetesCluster: $(aksClusterName)
+ namespace: $(namespace)
+ command: 'get'
+ arguments: |
+ pods --namespace $(namespace) -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}'
+ continueOnError: false
