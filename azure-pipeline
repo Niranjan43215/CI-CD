@@ -1,108 +1,231 @@
 trigger:
- branches:
- include:
- - main
+  branches:
+    include:
+      - main
+      - qa
+      - uat
+
 pool:
- vmImage: ubuntu-latest
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: environment
+    type: string
+    values:
+      - dev
+      - qa
+      - uat
+    default: dev  
+    
 variables:
- - group: 'sample-web-variable group'
+  - ${{ if eq(parameters.environment, 'dev') }}:
+      - group: 'know-me-api-variable-group'
+      - name: selectedVariableGroup
+        value: 'know-me-api-variable-group'
+  - ${{ if eq(parameters.environment, 'qa') }}:
+      - group: 'know-me-api-variable-group-qa'
+      - name: selectedVariableGroup
+        value: 'know-me-api-variable-group-qa'      
+  - ${{ if eq(parameters.environment, 'UAT') }}:
+      - group: 'know-me-api-variable-group-uat'
+      - name: selectedVariableGroup
+        value: 'know-me-api-variable-group-uat'        
+
 stages:
- - stage: BuildAndPush
- displayName: Build and Push Docker Image to ACR
- condition: and(succeeded(), eq(variables['SkipBuildAndPush'], 'false'))
- jobs:
- - job: Build
- displayName: Build Docker Image and Push to ACR
- steps:
- - checkout: self
- - task: Docker@2
- displayName: Build and Push Docker Image to ACR
- inputs:
- containerRegistry: $(dockerRegistryServiceConnection)
- repository: $(imageName)
- command: buildAndPush
- dockerfile: Dockerfile
- tags: |
- $(imageTag)
- - task: CopyFiles@2
- displayName: Copy Kubernetes Manifests
- inputs:
- SourceFolder: '$(System.DefaultWorkingDirectory)/manifests'
- Contents: "**"
- TargetFolder: '$(Build.ArtifactStagingDirectory)/manifests'
- - task: PublishBuildArtifacts@1
- displayName: Publish Build Artifacts
- inputs:
- PathtoPublish: $(Build.ArtifactStagingDirectory)/manifests
- ArtifactName: drop
- publishLocation: Container
- - stage: DeployToAKS
- displayName: Deploy to AKS
- dependsOn: BuildAndPush
- condition: always()
- jobs:
- - job: Deploy
- displayName: Deploy Docker Image to AKS
- steps:
- - task: DownloadBuildArtifacts@1
- displayName: Download Build Artifacts
- inputs:
- buildType: current
- downloadType: single
- artifactName: drop
- downloadPath: $(System.ArtifactsDirectory)
- - task: Kubernetes@1
- displayName: Configure kubectl context for AKS
- inputs:
- connectionType: 'Azure Resource Manager'
- azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
- azureResourceGroup: $(aksResourceGroup)
- kubernetesCluster: $(aksClusterName)
- command: 'get'
- arguments: 'nodes'
- - task: Kubernetes@1
- displayName: Create Namespace if Not Exists
- inputs:
- connectionType: 'Azure Resource Manager'
- azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
- azureResourceGroup: $(aksResourceGroup)
- kubernetesCluster: $(aksClusterName)
- namespace: ''
- command: 'apply'
- useConfigurationFile: true
- configuration: '$(System.ArtifactsDirectory)/drop/namespace.yaml'
- - script: |
- echo "Updating image tag in the Kubernetes deployment file..."
- sed -i 's|$(acrLogin server)/$(imageName):[^ ]*|$(acrLogin server)/$(imageName):$(imageTag)|' $(System.ArtifactsDirectory)/drop/sampleweb-deployment.yaml
- displayName: Update Image Tag in Deployment Manifest
- - task: Kubernetes@1
- displayName: Deploy Application to AKS
- inputs:
- connectionType: 'Azure Resource Manager'
- azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
- azureResourceGroup: $(aksResourceGroup)
- kubernetesCluster: $(aksClusterName)
- namespace: $(namespace)
- command: 'apply'
- useConfigurationFile: true
- configuration: '$(System.ArtifactsDirectory)/drop'
- - stage: VerifyDeployment
- displayName: Verify AKS Deployment Readiness Status
- dependsOn: DeployToAKS
- condition: succeeded() # Only run if the previous stages succeeded
- jobs:
- - job: Verify
- displayName: Verify AKS Deployment Readiness
- steps:
- - task: Kubernetes@1
- displayName: Check AKS Deployment Readiness
- inputs:
- connectionType: 'Azure Resource Manager'
- azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
- azureResourceGroup: $(aksResourceGroup)
- kubernetesCluster: $(aksClusterName)
- namespace: $(namespace)
- command: 'get'
- arguments: |
- pods --namespace $(namespace) -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}'
- continueOnError: false
+  - stage: SonarqubeCodeAnalysis
+    jobs:
+      - job: CodeQualityAnalysis
+        displayName: Performing Code Quality Analysis using Sonarqube
+        steps:  
+        - task: JavaToolInstaller@1
+          inputs:
+            versionSpec: '21'
+            jdkArchitectureOption: 'x64'
+            jdkSourceOption: PreInstalled      
+        - script: |
+              echo "The selected environment is ${{parameters.environment}}"
+          displayName: Display Selected Variable Group  
+        - task: MavenAuthenticate@0
+          inputs:
+            artifactsFeeds: 'Evoke-CaaS'
+            mavenServiceConnections: 
+            workloadIdentityServiceConnection: 'caas-artifact-feeds-svc'
+
+        # Step 1: Maven Build and Test
+        - task: Maven@4
+          inputs:
+            mavenPomFile: './pom.xml'
+            goals: 'clean verify'  # Ensure JaCoCo report is generated
+            options: '-DskipTests=false'
+            javaHomeOption: 'JDKVersion'
+            jdkVersionOption: '21'
+            mavenVersionOption: 'Default'
+            mavenAuthenticateFeed: false
+            effectivePomSkip: false
+
+        # Step 2: Publish JUnit Test Results
+        - task: PublishTestResults@2
+          inputs:
+            testResultsFiles: '**/surefire-reports/TEST-*.xml'
+            testRunTitle: 'JUnit Test Results'
+            mergeTestResults: true
+
+        # Step 3: Publish Code Coverage Results
+        - task: PublishCodeCoverageResults@2
+          inputs:
+            summaryFileLocation: '**/target/site/jacoco/jacoco.xml'
+            failIfCoverageEmpty: true
+
+        # Step 4: SonarCloud Analysis Preparation
+        - task: SonarCloudPrepare@3
+          inputs:
+            SonarCloud: 'caas-know-me-api-sonar'
+            organization: 'corsafe-caas'
+            scannerMode: 'CLI'
+            configMode: 'manual'
+            cliProjectKey: 'CorSafe-CaaS_know-me-api'
+            cliProjectName: 'know-me-api'
+            cliSources: 'src/main/java'
+            extraProperties: |
+              sonar.junit.reportPaths=target/surefire-reports
+              sonar.jacoco.reportPaths=target/site/jacoco/jacoco.xml
+
+        # Step 5: Run SonarCloud Analysis
+        - task: Maven@4
+          inputs:
+            mavenPomFile: './pom.xml'
+            goals: 'sonar:sonar'
+            javaHomeOption: 'JDKVersion'
+            jdkVersionOption: '21'
+            mavenVersionOption: 'Default'
+            mavenAuthenticateFeed: false
+            effectivePomSkip: false
+            sonarQubeRunAnalysis: false
+
+        # Step 6: Publish SonarCloud Quality Gate Result
+        - task: SonarCloudPublish@3
+          inputs:
+            pollingTimeoutSec: '300'
+
+
+  - stage: BuildAndPush
+    displayName: Build and Push Docker Image to ACR
+    condition: and(succeeded(), eq(variables['SkipBuildAndPush'], 'false'))
+    jobs:
+      - job: Build
+        displayName: Build Docker Image and Push to ACR
+        steps:
+          - checkout: self
+
+          - task: Docker@2
+            displayName: Build Docker Image with Build Arguments
+            inputs:
+              containerRegistry: $(dockerRegistryServiceConnection)
+              repository: $(imageName)
+              command: build
+              dockerfile: Dockerfile
+              arguments: --build-arg ENV=${{parameters.environment}}
+
+          - task: Docker@2
+            displayName: Login to ACR
+            inputs:
+              command: login
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+          - task: Docker@2
+            displayName: Push Docker Image to ACR
+            inputs:
+              containerRegistry: $(dockerRegistryServiceConnection)
+              repository: $(imageName)
+              command: push
+              tags: $(imageTag)        
+
+          - task: CopyFiles@2
+            displayName: Copy Kubernetes Manifests
+            inputs:
+              SourceFolder: '$(System.DefaultWorkingDirectory)/manifests'
+              Contents: "**"
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/manifests'
+              
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Build Artifacts
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/manifests
+              ArtifactName: drop
+              publishLocation: Container
+
+  - stage: DeployToAKS
+    displayName: Deploy to AKS
+    dependsOn: BuildAndPush
+    condition: always()
+    jobs:
+      - job: Deploy
+        displayName: Deploy Docker Image to AKS
+        steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: Download Build Artifacts
+            inputs:
+              buildType: current
+              downloadType: single
+              artifactName: drop
+              downloadPath: $(System.ArtifactsDirectory)
+
+          - task: Kubernetes@1
+            displayName: Configure kubectl context for AKS
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+              azureResourceGroup: $(aksResourceGroup)
+              kubernetesCluster: $(aksClusterName)
+              command: 'get'
+              arguments: 'nodes'
+
+          - task: Kubernetes@1
+            displayName: Create Namespace if Not Exists
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+              azureResourceGroup: $(aksResourceGroup)
+              kubernetesCluster: $(aksClusterName)
+              namespace: ''
+              command: 'apply'
+              useConfigurationFile: true
+              configuration: '$(System.ArtifactsDirectory)/drop/namespace.yaml'
+
+          - script: |
+              echo "Updating image tag in the Kubernetes deployment file..."
+              sed -i 's|acrName/imageName:[^ ]*|$(acrLoginserver)/$(imageName):$(imageTag)|' $(System.ArtifactsDirectory)/drop/knowmeapi-deployment.yaml
+            displayName: Update Image Tag in Deployment Manifest
+
+          - task: Kubernetes@1
+            displayName: Deploy Application to AKS
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+              azureResourceGroup: $(aksResourceGroup)
+              kubernetesCluster: $(aksClusterName)
+              namespace: $(namespace)
+              command: 'apply'
+              useConfigurationFile: true
+              configuration: '$(System.ArtifactsDirectory)/drop'
+
+  - stage: VerifyDeployment
+    displayName: Verify AKS Deployment Readiness Status
+    dependsOn: DeployToAKS
+    condition: succeeded()  # Only run if the previous stages succeeded
+    jobs:
+      - job: Verify
+        displayName: Verify AKS Deployment Readiness
+        steps:
+          - task: Kubernetes@1
+            displayName: Check AKS Deployment Readiness
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: $(azureSubscriptionServiceConnection)
+              azureResourceGroup: $(aksResourceGroup)
+              kubernetesCluster: $(aksClusterName)
+              namespace: $(namespace)
+              command: 'get'
+              arguments: |
+                pods --namespace $(namespace) -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}'
+            continueOnError: false
